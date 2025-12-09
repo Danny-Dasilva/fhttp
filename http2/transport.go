@@ -2880,7 +2880,7 @@ func (cc *ClientConn) writeStreamReset(streamID uint32, code ErrCode, err error)
 	// RST_STREAM there's no equivalent to GOAWAY frame's debug
 	// data, and the error codes are all pretty vague ("cancel").
 	cc.wmu.Lock()
-	fmt.Printf("reset err: %v code: %v StreamID: %v\n", err, code, streamID)
+	log.Printf("reset err: %v code: %v StreamID: %v\n", err, code, streamID)
 	cc.fr.WriteRSTStream(streamID, code)
 	cc.bw.Flush()
 	cc.wmu.Unlock()
