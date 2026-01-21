@@ -3378,7 +3378,7 @@ func TestTransportNoReuseAfterEarlyResponse(t *testing.T) {
 	}
 }
 
-// Tests that we don't leak Transport persistConn.readLoop goroutines
+// Tests that we don't leak Transport PersistConn.readLoop goroutines
 // when a server hangs up immediately after saying it would keep-alive.
 func TestTransportIssue10457(t *testing.T) {
 	defer afterTest(t) // used to fail in goroutine leak check

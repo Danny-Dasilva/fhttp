@@ -189,7 +189,7 @@ func (t *Transport) QueueForIdleConnForTesting() {
 }
 
 // PutIdleTestConn reports whether it was able to insert a fresh
-// persistConn for scheme, addr into the idle connection pool.
+// PersistConn for scheme, addr into the idle connection pool.
 func (t *Transport) PutIdleTestConn(scheme, addr string) bool {
 	c, _ := net.Pipe()
 	key := connectMethodKey{"", scheme, addr, false}
@@ -197,7 +197,7 @@ func (t *Transport) PutIdleTestConn(scheme, addr string) bool {
 	if t.MaxConnsPerHost > 0 {
 		// Transport is tracking conns-per-host.
 		// Increment connection count to account
-		// for new persistConn created below.
+		// for new PersistConn created below.
 		t.connsPerHostMu.Lock()
 		if t.connsPerHost == nil {
 			t.connsPerHost = make(map[connectMethodKey]int)
@@ -206,7 +206,7 @@ func (t *Transport) PutIdleTestConn(scheme, addr string) bool {
 		t.connsPerHostMu.Unlock()
 	}
 
-	return t.tryPutIdleConn(&persistConn{
+	return t.tryPutIdleConn(&PersistConn{
 		t:        t,
 		conn:     c,                   // dummy
 		closech:  make(chan struct{}), // so it can be closed
@@ -215,14 +215,14 @@ func (t *Transport) PutIdleTestConn(scheme, addr string) bool {
 }
 
 // PutIdleTestConnH2 reports whether it was able to insert a fresh
-// HTTP/2 persistConn for scheme, addr into the idle connection pool.
+// HTTP/2 PersistConn for scheme, addr into the idle connection pool.
 func (t *Transport) PutIdleTestConnH2(scheme, addr string, alt RoundTripper) bool {
 	key := connectMethodKey{"", scheme, addr, false}
 
 	if t.MaxConnsPerHost > 0 {
 		// Transport is tracking conns-per-host.
 		// Increment connection count to account
-		// for new persistConn created below.
+		// for new PersistConn created below.
 		t.connsPerHostMu.Lock()
 		if t.connsPerHost == nil {
 			t.connsPerHost = make(map[connectMethodKey]int)
@@ -231,7 +231,7 @@ func (t *Transport) PutIdleTestConnH2(scheme, addr string, alt RoundTripper) boo
 		t.connsPerHostMu.Unlock()
 	}
 
-	return t.tryPutIdleConn(&persistConn{
+	return t.tryPutIdleConn(&PersistConn{
 		t:        t,
 		alt:      alt,
 		cacheKey: key,

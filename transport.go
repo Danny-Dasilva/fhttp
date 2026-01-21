@@ -11,7 +11,6 @@ package http
 
 import (
 	"bufio"
-
 	"container/list"
 	"context"
 	"errors"
@@ -96,7 +95,7 @@ const DefaultMaxIdleConnsPerHost = 2
 type Transport struct {
 	idleMu       sync.Mutex
 	closeIdle    bool                                // user has requested to close all idle conns
-	idleConn     map[connectMethodKey][]*persistConn // most recently used at end
+	idleConn     map[connectMethodKey][]*PersistConn // most recently used at end
 	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
 	idleLRU      connLRU
 
@@ -153,7 +152,8 @@ type Transport struct {
 	// requests and the TLSClientConfig and TLSHandshakeTimeout
 	// are ignored. The returned net.Conn is assumed to already be
 	// past the TLS handshake.
-	DialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	DialTLSContext         func(ctx context.Context, network, addr string) (net.Conn, error)
+	PostProcessPersistConn func(persistConn *PersistConn) (*PersistConn, error)
 
 	// DialTLS specifies an optional dial function for creating
 	// TLS connections for non-proxied HTTPS requests.
@@ -672,7 +672,7 @@ func rewindBody(req *Request) (rewound *Request, err error) {
 // shouldRetryRequest reports whether we should retry sending a failed
 // HTTP request on a new connection. The non-nil input error is the
 // error from roundTrip.
-func (pc *persistConn) shouldRetryRequest(req *Request, err error) bool {
+func (pc *PersistConn) shouldRetryRequest(req *Request, err error) bool {
 	if http2isNoCachedConnError(err) {
 		// Issue 16582: if the user started a bunch of
 		// requests at once, they can all pick the same conn
@@ -851,7 +851,7 @@ var (
 	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
 	errTooManyIdleHost    = errors.New("http: putIdleConn: too many idle connections for host")
 	errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
-	errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
+	errReadLoopExiting    = errors.New("http: PersistConn.readLoop exiting")
 	errIdleConnTimeout    = errors.New("http: idle connection timeout")
 
 	// errServerClosedIdle is not seen by users for idempotent requests, but may be
@@ -879,7 +879,7 @@ func (e transportReadFromServerError) Error() string {
 	return fmt.Sprintf("net/http: Transport failed to read from server: %v", e.err)
 }
 
-func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
+func (t *Transport) putOrCloseIdleConn(pconn *PersistConn) {
 	if err := t.tryPutIdleConn(pconn); err != nil {
 		pconn.close(err)
 	}
@@ -897,7 +897,7 @@ func (t *Transport) maxIdleConnsPerHost() int {
 // If pconn is no longer needed or not in a good state, tryPutIdleConn returns
 // an error explaining why it wasn't registered.
 // tryPutIdleConn does not close pconn. Use putOrCloseIdleConn instead for that.
-func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
+func (t *Transport) tryPutIdleConn(pconn *PersistConn) error {
 	if t.DisableKeepAlives || t.MaxIdleConnsPerHost < 0 {
 		return errKeepAlivesDisabled
 	}
@@ -957,7 +957,7 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 		return errCloseIdle
 	}
 	if t.idleConn == nil {
-		t.idleConn = make(map[connectMethodKey][]*persistConn)
+		t.idleConn = make(map[connectMethodKey][]*PersistConn)
 	}
 	idles := t.idleConn[key]
 	if len(idles) >= t.maxIdleConnsPerHost() {
@@ -1011,7 +1011,7 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 	}
 
 	// If IdleConnTimeout is set, calculate the oldest
-	// persistConn.idleAt time we're willing to use a cached idle
+	// PersistConn.idleAt time we're willing to use a cached idle
 	// conn.
 	var oldTime time.Time
 	if t.IdleConnTimeout > 0 {
@@ -1036,9 +1036,9 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 				go pconn.closeConnIfStillIdle()
 			}
 			if pconn.isBroken() || tooOld {
-				// If either persistConn.readLoop has marked the connection
+				// If either PersistConn.readLoop has marked the connection
 				// broken, but Transport.removeIdleConn has not yet removed it
-				// from the idle list, or if this persistConn is too old (it was
+				// from the idle list, or if this PersistConn is too old (it was
 				// idle too long), then ignore it and look for another. In both
 				// cases it's already in the process of being closed.
 				list = list[:len(list)-1]
@@ -1080,14 +1080,14 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 }
 
 // removeIdleConn marks pconn as dead.
-func (t *Transport) removeIdleConn(pconn *persistConn) bool {
+func (t *Transport) removeIdleConn(pconn *PersistConn) bool {
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
 	return t.removeIdleConnLocked(pconn)
 }
 
 // t.idleMu must be held.
-func (t *Transport) removeIdleConnLocked(pconn *persistConn) bool {
+func (t *Transport) removeIdleConnLocked(pconn *PersistConn) bool {
 	if pconn.idleTimer != nil {
 		pconn.idleTimer.Stop()
 	}
@@ -1186,7 +1186,7 @@ type wantConn struct {
 	afterDial  func()
 
 	mu  sync.Mutex // protects pc, err, close(ready)
-	pc  *persistConn
+	pc  *PersistConn
 	err error
 }
 
@@ -1201,7 +1201,7 @@ func (w *wantConn) waiting() bool {
 }
 
 // tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
-func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
+func (w *wantConn) tryDeliver(pc *PersistConn, err error) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -1313,11 +1313,11 @@ func (t *Transport) customDialTLS(ctx context.Context, network, addr string) (co
 	return
 }
 
-// getConn dials and creates a new persistConn to the target as
+// getConn dials and creates a new PersistConn to the target as
 // specified in the connectMethod. This includes doing a proxy CONNECT
-// and/or setting up TLS.  If this doesn't return an error, the persistConn
+// and/or setting up TLS.  If this doesn't return an error, the PersistConn
 // is ready to write requests to.
-func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persistConn, err error) {
+func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *PersistConn, err error) {
 	req := treq.Request
 	trace := treq.trace
 	ctx := req.Context()
@@ -1501,7 +1501,7 @@ func (t *Transport) decConnsPerHost(key connectMethodKey) {
 // Add TLS to a persistent connection, i.e. negotiate a TLS session. If pconn is already a TLS
 // tunnel, this function establishes a nested TLS session inside the encrypted channel.
 // The remote endpoint's name may be overridden by TLSClientConfig.ServerName.
-func (pconn *persistConn) addTLS(name string, trace *httptrace.ClientTrace) error {
+func (pconn *PersistConn) addTLS(name string, trace *httptrace.ClientTrace) error {
 	// Initiate TLS and check remote host name against certificate.
 	cfg := cloneTLSConfig(pconn.t.TLSClientConfig)
 	if cfg.ServerName == "" {
@@ -1549,8 +1549,8 @@ type erringRoundTripper interface {
 	RoundTripErr() error
 }
 
-func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
-	pconn = &persistConn{
+func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *PersistConn, err error) {
+	pconn = &PersistConn{
 		t:             t,
 		cacheKey:      cm.key(),
 		reqch:         make(chan requestAndChan, 1),
@@ -1567,9 +1567,11 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 		return err
 	}
+
 	if cm.scheme() == "https" && t.hasCustomTLSDialer() {
 		var err error
 		pconn.conn, err = t.customDialTLS(ctx, "tcp", cm.addr())
+
 		if err != nil {
 			return nil, wrapErr(err)
 		}
@@ -1729,7 +1731,20 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 				// pconn.conn was closed by next (http2configureTransports.upgradeFn).
 				return nil, e.RoundTripErr()
 			}
-			return &persistConn{t: t, cacheKey: pconn.cacheKey, alt: alt}, nil
+			return &PersistConn{t: t, cacheKey: pconn.cacheKey, alt: alt}, nil
+		}
+	}
+
+	// patch: issue #281, see https://github.com/Danny-Dasilva/CycleTLS/issues/281
+	if t.PostProcessPersistConn != nil {
+		postPConn, err := t.PostProcessPersistConn(pconn)
+		if err != nil {
+			_ = pconn.conn.Close()
+			return nil, err
+		}
+
+		if postPConn != nil && postPConn.alt != nil {
+			return postPConn, nil
 		}
 	}
 
@@ -1748,7 +1763,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 // This is exactly 1 pointer field wide so it can go into an interface
 // without allocation.
 type persistConnWriter struct {
-	pc *persistConn
+	pc *PersistConn
 }
 
 func (w persistConnWriter) Write(p []byte) (n int, err error) {
@@ -1855,9 +1870,9 @@ func (k connectMethodKey) String() string {
 	return fmt.Sprintf("%s|%s%s|%s", k.proxy, k.scheme, h1, k.addr)
 }
 
-// persistConn wraps a connection, usually a persistent one
+// PersistConn wraps a connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well)
-type persistConn struct {
+type PersistConn struct {
 	// alt optionally specifies the TLS NextProto RoundTripper.
 	// This is used for HTTP/2 today and future protocols later.
 	// If it's non-nil, the rest of the fields are unused.
@@ -1900,14 +1915,14 @@ type persistConn struct {
 	mutateHeaderFunc func(Header)
 }
 
-func (pc *persistConn) maxHeaderResponseSize() int64 {
+func (pc *PersistConn) maxHeaderResponseSize() int64 {
 	if v := pc.t.MaxResponseHeaderBytes; v != 0 {
 		return v
 	}
 	return 10 << 20 // conservative default; same as http2
 }
 
-func (pc *persistConn) Read(p []byte) (n int, err error) {
+func (pc *PersistConn) Read(p []byte) (n int, err error) {
 	if pc.readLimit <= 0 {
 		return 0, fmt.Errorf("read limit of %d bytes exhausted", pc.maxHeaderResponseSize())
 	}
@@ -1923,7 +1938,7 @@ func (pc *persistConn) Read(p []byte) (n int, err error) {
 }
 
 // isBroken reports whether this connection is in a known broken state.
-func (pc *persistConn) isBroken() bool {
+func (pc *PersistConn) isBroken() bool {
 	pc.mu.Lock()
 	b := pc.closed != nil
 	pc.mu.Unlock()
@@ -1932,21 +1947,21 @@ func (pc *persistConn) isBroken() bool {
 
 // canceled returns non-nil if the connection was closed due to
 // CancelRequest or due to context cancellation.
-func (pc *persistConn) canceled() error {
+func (pc *PersistConn) canceled() error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	return pc.canceledErr
 }
 
 // isReused reports whether this connection has been used before.
-func (pc *persistConn) isReused() bool {
+func (pc *PersistConn) isReused() bool {
 	pc.mu.Lock()
 	r := pc.reused
 	pc.mu.Unlock()
 	return r
 }
 
-func (pc *persistConn) gotIdleConnTrace(idleAt time.Time) (t httptrace.GotConnInfo) {
+func (pc *PersistConn) gotIdleConnTrace(idleAt time.Time) (t httptrace.GotConnInfo) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	t.Reused = pc.reused
@@ -1958,7 +1973,7 @@ func (pc *persistConn) gotIdleConnTrace(idleAt time.Time) (t httptrace.GotConnIn
 	return
 }
 
-func (pc *persistConn) cancelRequest(err error) {
+func (pc *PersistConn) cancelRequest(err error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	pc.canceledErr = err
@@ -1966,9 +1981,9 @@ func (pc *persistConn) cancelRequest(err error) {
 }
 
 // closeConnIfStillIdle closes the connection if it's still sitting idle.
-// This is what's called by the persistConn's idleTimer, and is run in its
+// This is what's called by the PersistConn's idleTimer, and is run in its
 // own goroutine.
-func (pc *persistConn) closeConnIfStillIdle() {
+func (pc *PersistConn) closeConnIfStillIdle() {
 	t := pc.t
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
@@ -1981,14 +1996,14 @@ func (pc *persistConn) closeConnIfStillIdle() {
 }
 
 // mapRoundTripError returns the appropriate error value for
-// persistConn.roundTrip.
+// PersistConn.roundTrip.
 //
-// The provided err is the first error that (*persistConn).roundTrip
+// The provided err is the first error that (*PersistConn).roundTrip
 // happened to receive from its select statement.
 //
 // The startBytesWritten value should be the value of pc.nwrite before the roundTrip
 // started writing the request.
-func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritten int64, err error) error {
+func (pc *PersistConn) mapRoundTripError(req *transportRequest, startBytesWritten int64, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -1997,7 +2012,7 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritte
 	// races on callers who mutate the request on failure.
 	//
 	// When resc in pc.roundTrip and hence rc.ch receives a responseAndError
-	// with a non-nil error it implies that the persistConn is either closed
+	// with a non-nil error it implies that the PersistConn is either closed
 	// or closing. Waiting on pc.writeLoopDone is hence safe as all callers
 	// close closech which in turn ensures writeLoop returns.
 	<-pc.writeLoopDone
@@ -2040,7 +2055,7 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritte
 // closing a net.Conn that is now owned by the caller.
 var errCallerOwnsConn = errors.New("read loop ending; caller owns writable underlying conn")
 
-func (pc *persistConn) readLoop() {
+func (pc *PersistConn) readLoop() {
 	closeErr := errReadLoopExiting // default value, if not changed below
 	defer func() {
 		pc.close(closeErr)
@@ -2130,8 +2145,8 @@ func (pc *persistConn) readLoop() {
 			// Put the idle conn back into the pool before we send the response
 			// so if they process it quickly and make another request, they'll
 			// get this same conn. But we use the unbuffered channel 'rc'
-			// to guarantee that persistConn.roundTrip got out of its select
-			// potentially waiting for this persistConn to close.
+			// to guarantee that PersistConn.roundTrip got out of its select
+			// potentially waiting for this PersistConn to close.
 			alive = alive &&
 				!pc.sawEOF &&
 				pc.wroteRequest() &&
@@ -2213,7 +2228,7 @@ func (pc *persistConn) readLoop() {
 	}
 }
 
-func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
+func (pc *PersistConn) readLoopPeekFailLocked(peekErr error) {
 	if pc.closed != nil {
 		return
 	}
@@ -2250,7 +2265,7 @@ func is408Message(buf []byte) bool {
 // readResponse reads an HTTP response (or two, in the case of "Expect:
 // 100-continue") from the server. It returns the final non-100 one.
 // trace is optional.
-func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTrace) (resp *Response, err error) {
+func (pc *PersistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTrace) (resp *Response, err error) {
 	if trace != nil && trace.GotFirstResponseByte != nil {
 		if peek, err := pc.br.Peek(1); err == nil && len(peek) == 1 {
 			trace.GotFirstResponseByte()
@@ -2307,7 +2322,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 // waitForContinue returns the function to block until
 // any response, timeout or connection close. After any of them,
 // the function returns a bool which indicates if the body should be sent.
-func (pc *persistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
+func (pc *PersistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
 	if continueCh == nil {
 		return nil
 	}
@@ -2364,7 +2379,7 @@ type nothingWrittenError struct {
 	error
 }
 
-func (pc *persistConn) writeLoop() {
+func (pc *PersistConn) writeLoop() {
 	defer close(pc.writeLoopDone)
 	for {
 		select {
@@ -2404,12 +2419,12 @@ func (pc *persistConn) writeLoop() {
 
 // maxWriteWaitBeforeConnReuse is how long the a Transport RoundTrip
 // will wait to see the Request's Body.Write result after getting a
-// response from the server. See comments in (*persistConn).wroteRequest.
+// response from the server. See comments in (*PersistConn).wroteRequest.
 const maxWriteWaitBeforeConnReuse = 50 * time.Millisecond
 
 // wroteRequest is a check before recycling a connection that the previous write
 // (from writeLoop above) happened and was successful.
-func (pc *persistConn) wroteRequest() bool {
+func (pc *PersistConn) wroteRequest() bool {
 	select {
 	case err := <-pc.writeErrCh:
 		// Common case: the write happened well before the response, so
@@ -2435,6 +2450,14 @@ func (pc *persistConn) wroteRequest() bool {
 			return false
 		}
 	}
+}
+
+func (pc *PersistConn) SetAlt(roundTripper RoundTripper) {
+	pc.alt = roundTripper
+}
+
+func (pc *PersistConn) GetConn() net.Conn {
+	return pc.conn
 }
 
 // responseAndError is how the goroutine reading from an HTTP/1 server
@@ -2504,7 +2527,7 @@ var (
 	testHookReadLoopBeforeNextRead             = nop
 )
 
-func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+func (pc *PersistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	testHookEnterRoundTrip()
 	if !pc.t.replaceReqCanceler(req.cancelKey, pc.cancelRequest) {
 		pc.t.putOrCloseIdleConn(pc)
@@ -2634,7 +2657,7 @@ func (tr *transportRequest) logf(format string, args ...interface{}) {
 
 // markReused marks this connection as having been successfully used for a
 // request and response.
-func (pc *persistConn) markReused() {
+func (pc *PersistConn) markReused() {
 	pc.mu.Lock()
 	pc.reused = true
 	pc.mu.Unlock()
@@ -2645,13 +2668,13 @@ func (pc *persistConn) markReused() {
 //
 // The provided err is only for testing and debugging; in normal
 // circumstances it should never be seen by users.
-func (pc *persistConn) close(err error) {
+func (pc *PersistConn) close(err error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	pc.closeLocked(err)
 }
 
-func (pc *persistConn) closeLocked(err error) {
+func (pc *PersistConn) closeLocked(err error) {
 	if err == nil {
 		panic("nil error")
 	}
@@ -2784,33 +2807,33 @@ func cloneTLSConfig(cfg *tls.Config) *tls.Config {
 }
 
 type connLRU struct {
-	ll *list.List // list.Element.Value type is of *persistConn
-	m  map[*persistConn]*list.Element
+	ll *list.List // list.Element.Value type is of *PersistConn
+	m  map[*PersistConn]*list.Element
 }
 
 // add adds pc to the head of the linked list.
-func (cl *connLRU) add(pc *persistConn) {
+func (cl *connLRU) add(pc *PersistConn) {
 	if cl.ll == nil {
 		cl.ll = list.New()
-		cl.m = make(map[*persistConn]*list.Element)
+		cl.m = make(map[*PersistConn]*list.Element)
 	}
 	ele := cl.ll.PushFront(pc)
 	if _, ok := cl.m[pc]; ok {
-		panic("persistConn was already in LRU")
+		panic("PersistConn was already in LRU")
 	}
 	cl.m[pc] = ele
 }
 
-func (cl *connLRU) removeOldest() *persistConn {
+func (cl *connLRU) removeOldest() *PersistConn {
 	ele := cl.ll.Back()
-	pc := ele.Value.(*persistConn)
+	pc := ele.Value.(*PersistConn)
 	cl.ll.Remove(ele)
 	delete(cl.m, pc)
 	return pc
 }
 
 // remove removes pc from cl.
-func (cl *connLRU) remove(pc *persistConn) {
+func (cl *connLRU) remove(pc *PersistConn) {
 	if ele, ok := cl.m[pc]; ok {
 		cl.ll.Remove(ele)
 		delete(cl.m, pc)

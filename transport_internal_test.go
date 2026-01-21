@@ -112,26 +112,26 @@ func (issue22091Error) Error() string             { return "issue22091Error" }
 
 func TestTransportShouldRetryRequest(t *testing.T) {
 	tests := []struct {
-		pc  *persistConn
+		pc  *PersistConn
 		req *Request
 
 		err  error
 		want bool
 	}{
 		0: {
-			pc:   &persistConn{reused: false},
+			pc:   &PersistConn{reused: false},
 			req:  dummyRequest("POST"),
 			err:  nothingWrittenError{},
 			want: false,
 		},
 		1: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("POST"),
 			err:  nothingWrittenError{},
 			want: true,
 		},
 		2: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("POST"),
 			err:  http2ErrNoCachedConn,
 			want: true,
@@ -143,37 +143,37 @@ func TestTransportShouldRetryRequest(t *testing.T) {
 			want: true,
 		},
 		4: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("POST"),
 			err:  errMissingHost,
 			want: false,
 		},
 		5: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("POST"),
 			err:  transportReadFromServerError{},
 			want: false,
 		},
 		6: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("GET"),
 			err:  transportReadFromServerError{},
 			want: true,
 		},
 		7: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequest("GET"),
 			err:  errServerClosedIdle,
 			want: true,
 		},
 		8: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequestWithBody("POST"),
 			err:  nothingWrittenError{},
 			want: true,
 		},
 		9: {
-			pc:   &persistConn{reused: true},
+			pc:   &PersistConn{reused: true},
 			req:  dummyRequestWithBodyNoGetBody("POST"),
 			err:  nothingWrittenError{},
 			want: false,
